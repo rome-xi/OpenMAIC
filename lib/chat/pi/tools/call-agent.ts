@@ -1,3 +1,4 @@
+import { formatChildResult } from './child-result';
 import { createAbortableSend } from '../send';
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { Type, type Static } from 'typebox';
@@ -30,7 +31,7 @@ import {
   sanitizeVisibleSpeech,
   toHistoryMessages,
 } from '../prompts';
-import type { SendEvent } from '../types';
+import type { PiStreamFnFactory, SendEvent } from '../types';
 import {
   buildChildActionTools,
   createPiWhiteboardRuntimeState,
@@ -536,6 +537,8 @@ export function buildCallAgentTool(opts: {
   agentConfigs: AgentConfig[];
   send: SendEvent;
   languageModel: LanguageModel;
+  streamFnFactory?: PiStreamFnFactory;
+  nativeChildTimeoutMs?: number;
   onAgentDone: (summary: AgentTurnSummary) => void;
   onActionDone: (record?: WhiteboardActionRecord) => void;
   thinkingConfig: ThinkingConfig;
@@ -723,13 +726,16 @@ export function buildCallAgentTool(opts: {
           const availableToolNames = nativeTools.map((tool) => tool.name);
           const sanitizeNativeDelta = createVisibleSpeechDeltaSanitizer();
           const nativeResult = await runNativeChild({
-            streamFn: createCallLlmStreamFn({
-              languageModel: opts.languageModel,
-              source: 'pi-chat-native-child',
-              thinkingConfig: opts.thinkingConfig,
-              maxOutputTokens: opts.maxOutputTokens,
-              abortSignal: childAbort.signal,
-            }),
+            streamFn: (opts.streamFnFactory ?? createCallLlmStreamFn)(
+              {
+                languageModel: opts.languageModel,
+                source: 'pi-chat-native-child',
+                thinkingConfig: opts.thinkingConfig,
+                maxOutputTokens: opts.maxOutputTokens,
+                abortSignal: childAbort.signal,
+              },
+              agent,
+            ),
             systemPrompt: buildNativeChildPrompt(
               opts.body,
               agent,
@@ -746,7 +752,7 @@ export function buildCallAgentTool(opts: {
             allowedToolNames: new Set(availableToolNames),
             history: toHistoryMessages(opts.body.messages),
             abortSignal: childAbort.signal,
-            timeoutMs: 60_000,
+            timeoutMs: opts.nativeChildTimeoutMs ?? 60_000,
             maxProviderTransports: 5,
             onVisibleTextDelta: async (delta) => {
               const visibleDelta = sanitizeNativeDelta(delta);
@@ -764,7 +770,13 @@ export function buildCallAgentTool(opts: {
           }
 
           const finalText = nativeResult.visibleOutput.trim();
-          const isCompleted = nativeResult.status === 'completed';
+          const formatted = formatChildResult({
+            agentName: agent.name,
+            text: finalText,
+            actionCount,
+            status: nativeResult.status,
+            stopReason: nativeResult.stopReason,
+          });
           await send({ type: 'agent_end', data: { messageId, agentId: agent.id } });
           childAbort.signal.throwIfAborted();
           opts.onAgentDone({
@@ -780,7 +792,7 @@ export function buildCallAgentTool(opts: {
             content: [
               {
                 type: 'text',
-                text: `${agent.name}: ${finalText || '(no visible response)'}`,
+                text: formatted.text,
               },
             ],
             details: {
@@ -797,7 +809,7 @@ export function buildCallAgentTool(opts: {
                   }
                 : {}),
             },
-            ...(isCompleted ? {} : { isError: true }),
+            ...(formatted.isError ? { isError: true } : {}),
           };
         }
 
@@ -821,13 +833,16 @@ export function buildCallAgentTool(opts: {
         const childToolsByName = new Map(childTools.map((tool) => [tool.name, tool]));
 
         const child = buildAgent({
-          streamFn: createCallLlmStreamFn({
-            languageModel: opts.languageModel,
-            source: 'pi-chat-child',
-            thinkingConfig: opts.thinkingConfig,
-            maxOutputTokens: opts.maxOutputTokens,
-            abortSignal: childAbort.signal,
-          }),
+          streamFn: (opts.streamFnFactory ?? createCallLlmStreamFn)(
+            {
+              languageModel: opts.languageModel,
+              source: 'pi-chat-child',
+              thinkingConfig: opts.thinkingConfig,
+              maxOutputTokens: opts.maxOutputTokens,
+              abortSignal: childAbort.signal,
+            },
+            agent,
+          ),
           systemPrompt: buildChildPrompt(
             opts.body,
             agent,
@@ -862,6 +877,7 @@ export function buildCallAgentTool(opts: {
           });
         });
 
+        let childErrored = false;
         try {
           childAbort.signal.throwIfAborted();
           await child.prompt(
@@ -876,6 +892,7 @@ export function buildCallAgentTool(opts: {
           // Preserve the Legacy result lifecycle for failures; cancellation must
           // not finalize or report the partial response as a completed turn.
           if (childAbort.signal.aborted) throw error;
+          childErrored = true;
         } finally {
           unsubscribe();
           childAbort.signal.removeEventListener('abort', abortChild);
@@ -912,6 +929,20 @@ export function buildCallAgentTool(opts: {
         const safeFallback =
           fallbackText && !isLikelyRawStructuredFallback(fallbackText) ? fallbackText : '';
         const finalText = emittedText || safeFallback;
+        const lastAssistant = child.state.messages.findLast(
+          (message) => message.role === 'assistant',
+        );
+        const stopReason =
+          lastAssistant?.role === 'assistant' ? lastAssistant.stopReason : undefined;
+        childErrored ||=
+          Boolean(child.state.errorMessage) || stopReason === 'error' || stopReason === 'aborted';
+        const formatted = formatChildResult({
+          agentName: agent.name,
+          text: finalText,
+          actionCount,
+          status: childErrored ? 'failed' : stopReason === 'length' ? 'exhausted' : 'completed',
+          stopReason: stopReason === 'length' ? 'output_token_limit' : undefined,
+        });
         if (finalText && !emittedText) {
           await send({ type: 'text_delta', data: { content: finalText, messageId } });
         }
@@ -927,10 +958,11 @@ export function buildCallAgentTool(opts: {
         });
 
         return {
+          ...(formatted.isError ? { isError: true } : {}),
           content: [
             {
               type: 'text',
-              text: `${agent.name}: ${finalText || '(no visible response)'}`,
+              text: formatted.text,
             },
           ],
           details: {
